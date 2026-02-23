@@ -9,11 +9,12 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = str(os.environ["CHAT_ID"])  # строкой, чтобы сравнивать без сюрпризов
+CHAT_ID = str(os.environ["CHAT_ID"])
 
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "300"))  # 5 минут
-DATA_DIR = Path(os.environ.get("DATA_DIR", "."))  # на Render лучше /var/data (см. ниже)
-STATE_FILE = DATA_DIR / "tracks.json"
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "600"))  # 10 минут по умолчанию
+
+# ВАЖНО: на бесплатном Render это будет временное хранилище.
+STATE_FILE = Path("tracks.json")
 
 TRACK_RE = re.compile(r"[?&]track=([\d\-]+)")
 
@@ -26,7 +27,6 @@ def load_tracks() -> dict:
     return {}
 
 def save_tracks(data: dict) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def tg_send(text: str) -> None:
@@ -46,8 +46,6 @@ async def ozon_get_status(track: str) -> str:
         await browser.close()
 
     text = " ".join(body_text.split()).lower()
-
-    # Достаточно “крупных” статусов. Можно расширить позже.
     candidates = [
         "доставлено",
         "готово к выдаче",
@@ -65,7 +63,7 @@ async def ozon_get_status(track: str) -> str:
     return "unknown"
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 1) Принимаем сообщения только от тебя
+    # Только ты
     if str(update.effective_chat.id) != CHAT_ID:
         return
 
@@ -86,22 +84,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Добавил трек: {track}")
 
 async def watcher_loop():
-    # Первый запуск: не спамим — просто фиксируем текущие статусы
+    # Первый запуск: фиксируем статусы без спама
     tracks = load_tracks()
-    changed_any = False
+    changed = False
     for track, info in tracks.items():
         if info.get("status") is None:
             try:
                 info["status"] = await ozon_get_status(track)
-                changed_any = True
+                changed = True
             except Exception:
                 pass
-    if changed_any:
+    if changed:
         save_tracks(tracks)
 
-    tg_send("🤖 Бот запущен и следит за Ozon-треками. Кидай ссылки tracking.ozon.ru")
+    tg_send("🤖 Бот запущен. Кидай ссылки tracking.ozon.ru/?track=...")
 
-    # Основной цикл
     while True:
         tracks = load_tracks()
         updated = False
@@ -118,7 +115,6 @@ async def watcher_loop():
                     info["status"] = new
                     updated = True
             except Exception:
-                # молча переживаем временные ошибки сети/страницы
                 continue
 
         if updated:
@@ -130,7 +126,6 @@ async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # запускаем watcher параллельно с polling
     asyncio.create_task(watcher_loop())
     await app.run_polling(close_loop=False)
 
