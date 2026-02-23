@@ -149,44 +149,84 @@ def normalize_status(text: str) -> str:
     return text
 
 async def ozon_get_status(track: str) -> str:
-    url = f"https://tracking.ozon.ru/?track={track}&__rr=1"
+    base_url = "https://tracking.ozon.ru"
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=60000)
-        body_text = await page.inner_text("body")
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        context = await browser.new_context(
+            locale="ru-RU",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+        )
+        page = await context.new_page()
+
+        # 1) Открываем главную
+        await page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
+
+        # 2) Ищем инпут и вводим трек как человек
+        # На сайте селекторы могут меняться, поэтому берём "первый попавшийся input"
+        inp = page.locator("input").first
+        await inp.wait_for(timeout=20000)
+        await inp.fill(track)
+        await inp.press("Enter")
+
+        # 3) Дадим странице догрузить результаты
+        await page.wait_for_load_state("networkidle", timeout=60000)
+        await page.wait_for_timeout(1500)
+
+        # 4) Читаем текст страницы
+        body_text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+
+        await context.close()
         await browser.close()
 
-    text = " ".join(body_text.split()).lower()
+    text = " ".join((body_text or "").split()).lower()
+
+    # На всякий случай: если нас встретил антибот/пустая страница
+    if len(text) < 80:
+        return "unknown"
 
     statuses = [
         "создан",
         "передается в доставку",
+        "передаётся в доставку",
+        "передан в доставку",
         "в пути",
         "заказ принят перевозчиком",
-        "везут на таможню",
-        "прибыл на таможню",
-        "импортное таможенное оформление",
-        "выпущен импортной таможней",
-        "отправили на сортировочный терминал",
-        "покинул сортировочный терминал",
-        "ожидает отправки",
-        "везут в город получателя",
-        "везут",
-        "передали в курьерскую доставку",
+        "заказ везут на таможню",
+        "заказ везут на таможню в стране отправления",
+        "заказ везут на таможню в стране назначения",
+        "заказ привезли на таможню",
+        "заказ передан на импортное таможенное оформление",
+        "заказ проходит импортное таможенное оформление",
+        "заказ выпущен импортной таможней",
+        "заказ отправили на сортировочный терминал",
+        "заказ покинул сортировочный терминал",
+        "заказ ожидает отправки в город получателя",
+        "заказ везут в город получателя",
+        "заказ везут",
+        "заказ передали в курьерскую доставку",
         "на пункте выдачи",
         "готово к выдаче",
         "доставлено",
         "получено",
+        "успешно доставлен",
     ]
 
-    for status in statuses:
-        if status in text:
-            return status
+    for s in statuses:
+        if s in text:
+            return s
 
     return "unknown"
-
 
 # =========================
 # Bot logic
