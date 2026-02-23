@@ -1,16 +1,83 @@
-import asyncio
 import json
+import os
 import re
+import time
+from pathlib import Path
+from typing import Any, Optional, Tuple
+
 import requests
+from flask import Flask
+from telegram import ReplyKeyboardMarkup, KeyboardButton, Update
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    ContextTypes,
+    ConversationHandler,
+    filters,
+)
 
-NEXT_DATA_RE = re.compile(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
+# ------------------ ENV ------------------
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+CHAT_ID = str(os.environ.get("CHAT_ID", "")).strip()  # можно пустым => бот будет отвечать всем
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "600"))
+PORT = int(os.environ.get("PORT", "10000"))
 
-# расширенный список статусов (ты просила "всё")
-STATUS_CANDIDATES = [
-    "создан",
-    "передается в доставку",
-    "передаётся в доставку",
+STATE_FILE = Path("tracks.json")
+
+TRACK_RE = re.compile(r"(?:(?:https?://)?tracking\.ozon\.ru/\?track=)?([\d\-]{6,})", re.I)
+
+# ------------------ Flask app for Render ------------------
+app = Flask(__name__)
+
+@app.get("/")
+def home():
+    return "ok", 200
+
+
+# ------------------ Storage ------------------
+def load_tracks() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def save_tracks(data: dict) -> None:
+    STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ------------------ Telegram helpers ------------------
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("➕ Добавить трек"), KeyboardButton("📦 Отслеживаемые")],
+            [KeyboardButton("➖ Удалить трек"), KeyboardButton("ℹ️ Помощь")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Кинь ссылку tracking.ozon.ru/?track=... или трек-номер",
+    )
+
+def allowed_chat(update: Update) -> bool:
+    if not CHAT_ID:
+        return True
+    try:
+        return str(update.effective_chat.id) == CHAT_ID
+    except Exception:
+        return False
+
+
+# ------------------ Ozon status parsing ------------------
+CANDIDATES = [
+    # верхние "живые" статусы
+    "доставлено",
+    "готово к выдаче",
+    "на пункте выдачи",
     "в пути",
+    "передается в доставку",
+    "передано в доставку",
+    "создан",
     "заказ принят перевозчиком",
     "заказ везут на таможню в стране отправления",
     "заказ привезли на таможню для экспортного таможенного оформления",
@@ -25,96 +92,301 @@ STATUS_CANDIDATES = [
     "заказ везут в город получателя",
     "заказ везут",
     "заказ передали в курьерскую доставку",
-    "готово к выдаче",
-    "на пункте выдачи",
-    "доставлено",
     "заказ успешно доставлен получателю",
+    # общие
+    "прибыло",
+    "передано",
     "получено",
+    "ожидает",
+    "отправлено",
 ]
 
-def _requests_fetch_tracking_html(track: str) -> str:
-    url = f"https://tracking.ozon.ru/?track={track}&__rr=1"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-        "Connection": "keep-alive",
-    }
-    r = requests.get(url, headers=headers, timeout=25)
-    r.raise_for_status()
-    return r.text
-
-def _extract_status_from_next_data(html: str) -> str | None:
-    m = NEXT_DATA_RE.search(html)
+def _find_next_data(html: str) -> Optional[dict]:
+    """
+    Ищем <script id="__NEXT_DATA__" type="application/json">...</script>
+    """
+    m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S | re.I)
     if not m:
         return None
-
-    raw = m.group(1)
+    raw = m.group(1).strip()
     try:
-        data = json.loads(raw)
+        return json.loads(raw)
     except Exception:
         return None
 
-    # Мы не знаем точную структуру JSON, поэтому ищем строки-статусы "грубой силой"
-    # (зато работает даже если структура поменяется)
-    blob = json.dumps(data, ensure_ascii=False).lower()
-    for s in STATUS_CANDIDATES:
-        if s.lower() in blob:
-            # вернём самый "поздний" найденный статус: пробежимся по списку в порядке приоритета
-            # (ниже сделаем умнее, когда поймаем XHR)
-            pass
-
-    # лучше: ищем самый "продвинутый" статус по нашему списку — берём последний встретившийся
-    found = None
-    for s in STATUS_CANDIDATES:
-        if s.lower() in blob:
-            found = s
-    return found
-
-def _extract_status_from_html_text(html: str) -> str | None:
-    text = " ".join(re.sub(r"<[^>]+>", " ", html).split()).lower()
-    found = None
-    for s in STATUS_CANDIDATES:
-        if s.lower() in text:
-            found = s
-    return found
-
-def ozon_get_status_sync(track: str) -> tuple[str, str | None]:
+def _walk_strings(obj: Any):
     """
-    Возвращает (status, error)
-    status: строка или 'unknown'
-    error: строка ошибки или None
+    Генератор всех строк внутри JSON/словарей/списков.
     """
+    if obj is None:
+        return
+    if isinstance(obj, str):
+        yield obj
+        return
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _walk_strings(v)
+        return
+    if isinstance(obj, list):
+        for it in obj:
+            yield from _walk_strings(it)
+        return
+
+def _best_status_from_text(text: str) -> str:
+    t = " ".join(text.split()).lower()
+    for c in CANDIDATES:
+        if c in t:
+            return c
+    return "unknown"
+
+def ozon_get_status_direct(track: str) -> Tuple[str, str]:
+    """
+    Возвращает (status, debug_reason)
+    """
+    url = f"https://tracking.ozon.ru/?track={track}&__rr=1"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/122 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    }
+
+    r = requests.get(url, headers=headers, timeout=30)
+    html = r.text or ""
+
+    # 1) Пробуем Next.js данные
+    next_data = _find_next_data(html)
+    if next_data:
+        joined = " ".join(s.lower() for s in _walk_strings(next_data) if isinstance(s, str))
+        status = _best_status_from_text(joined)
+        if status != "unknown":
+            return status, "next_data"
+
+    # 2) Фолбэк: просто по HTML/тексту страницы
+    status = _best_status_from_text(html)
+    if status != "unknown":
+        return status, "html_text"
+
+    # 3) Если вообще ничего
+    return "unknown", f"http_{r.status_code}"
+
+# ------------------ Bot logic ------------------
+ADD_WAITING = 1
+DEL_WAITING = 2
+
+async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    if not allowed_chat(update):
+        return
+    await update.message.reply_text(
+        "Я отслеживаю статусы заказов Ozon по публичному треку.\n\n"
+        "Кнопки:\n"
+        "• ➕ Добавить трек — пришли ссылку или номер\n"
+        "• 📦 Отслеживаемые — список текущих\n"
+        "• ➖ Удалить трек — удали по номеру\n\n"
+        f"Опрос статусов раз в {POLL_SECONDS//60} мин.",
+        reply_markup=main_menu_kb(),
+        disable_web_page_preview=True,
+    )
+
+async def show_tracks(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    if not allowed_chat(update):
+        return
+    tracks = load_tracks()
+    if not tracks:
+        await update.message.reply_text("📦 Пока нет отслеживаемых треков.", reply_markup=main_menu_kb())
+        return
+    lines = ["📦 Отслеживаемые треки:"]
+    for tr, info in tracks.items():
+        st = info.get("status") or "unknown"
+        lines.append(f"• {tr} — {st}")
+    await update.message.reply_text("\n".join(lines), reply_markup=main_menu_kb())
+
+async def start_add(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    if not allowed_chat(update):
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "Пришли ссылку/трек вида:\n"
+        "https://tracking.ozon.ru/?track=94044975-0220-1\n"
+        "или просто 94044975-0220-1",
+        reply_markup=main_menu_kb(),
+        disable_web_page_preview=True,
+    )
+    return ADD_WAITING
+
+async def add_track(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    if not allowed_chat(update):
+        return ConversationHandler.END
+
+    text = (update.message.text or "").strip()
+    m = TRACK_RE.search(text)
+    if not m:
+        await update.message.reply_text("Не вижу трек. Пришли номер вида 94044975-0220-1.")
+        return ADD_WAITING
+
+    track = m.group(1)
+    tracks = load_tracks()
+
+    if track in tracks:
+        await update.message.reply_text(f"Уже отслеживается: {track}", reply_markup=main_menu_kb())
+        return ConversationHandler.END
+
+    tracks[track] = {"status": None, "last_checked": None}
+    save_tracks(tracks)
+
+    await update.message.reply_text(f"✅ Добавил трек: {track}\n⏳ Проверяю статус…", reply_markup=main_menu_kb())
+
     try:
-        html = _requests_fetch_tracking_html(track)
+        status, reason = ozon_get_status_direct(track)
+        tracks = load_tracks()
+        if track in tracks:
+            tracks[track]["status"] = status
+            tracks[track]["last_checked"] = int(time.time())
+            save_tracks(tracks)
+
+        if status == "unknown":
+            await update.message.reply_text(
+                f"🤷 Пока не смог вытащить статус (unknown).\nПричина: {reason}\n"
+                "Я буду пробовать дальше по расписанию.",
+                reply_markup=main_menu_kb(),
+            )
+        else:
+            await update.message.reply_text(
+                f"📦 {track}: {status} (источник: {reason})",
+                reply_markup=main_menu_kb(),
+            )
     except Exception as e:
-        return ("unknown", f"fetch_failed: {repr(e)}")
+        await update.message.reply_text(
+            f"🤷 Ошибка при проверке: {type(e).__name__}: {e}\n"
+            "Я буду пробовать дальше по расписанию.",
+            reply_markup=main_menu_kb(),
+        )
 
-    status = _extract_status_from_next_data(html) or _extract_status_from_html_text(html)
-    if status:
-        return (status, None)
+    return ConversationHandler.END
 
-    # Если вообще ничего не нашли — возможно, отдали заглушку/бот-чек
-    # (например, "частный доступ" / капча / пустая страница)
-    hint = "no_status_found"
-    if "частный доступ" in html.lower():
-        hint = "private_access_text_seen"
-    if "captcha" in html.lower():
-        hint = "captcha_seen"
-    return ("unknown", hint)
+async def start_del(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    if not allowed_chat(update):
+        return ConversationHandler.END
+    await update.message.reply_text("Пришли номер трека, который удалить (например 94044975-0220-1).")
+    return DEL_WAITING
 
-async def ozon_get_status(track: str) -> tuple[str, str | None]:
-    # чтобы не блокировать event loop телеграм-бота
-    return await asyncio.to_thread(ozon_get_status_sync, track)
-# --- entrypoints for bot_runner.py ---
-async def _run_bot_async_entry() -> None:
-    await run_bot_async()  # если у тебя функция называется run_bot_async
+async def del_track(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    if not allowed_chat(update):
+        return ConversationHandler.END
 
+    text = (update.message.text or "").strip()
+    m = TRACK_RE.search(text)
+    if not m:
+        await update.message.reply_text("Не вижу трек. Пришли номер вида 94044975-0220-1.")
+        return DEL_WAITING
+
+    track = m.group(1)
+    tracks = load_tracks()
+
+    if track not in tracks:
+        await update.message.reply_text("Такого трека нет в списке.", reply_markup=main_menu_kb())
+        return ConversationHandler.END
+
+    del tracks[track]
+    save_tracks(tracks)
+    await update.message.reply_text(f"🗑 Удалил трек: {track}", reply_markup=main_menu_kb())
+    return ConversationHandler.END
+
+async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed_chat(update):
+        return
+
+    text = (update.message.text or "").strip()
+
+    if text == "📦 Отслеживаемые":
+        await show_tracks(update, context)
+        return
+
+    if text == "ℹ️ Помощь":
+        await cmd_help(update, context)
+        return
+
+    # Если человек просто кидает ссылку/номер без кнопки — считаем как "добавить"
+    m = TRACK_RE.search(text)
+    if m:
+        # имитируем “добавление” без ConversationHandler
+        await add_track(update, context)
+        return
+
+    await update.message.reply_text("Нажми кнопку или пришли ссылку/трек.", reply_markup=main_menu_kb())
+
+
+# ------------------ Scheduler job ------------------
+async def check_all_tracks(context: ContextTypes.DEFAULT_TYPE) -> None:
+    tracks = load_tracks()
+    if not tracks:
+        return
+
+    changed_any = False
+
+    for tr, info in list(tracks.items()):
+        old = info.get("status")
+
+        try:
+            new, reason = ozon_get_status_direct(tr)
+        except Exception:
+            continue
+
+        tracks = load_tracks()
+        if tr not in tracks:
+            continue
+
+        tracks[tr]["last_checked"] = int(time.time())
+
+        if new != "unknown" and old and new != old:
+            # уведомляем только при реальной смене
+            await context.bot.send_message(chat_id=CHAT_ID or context._chat_id, text=f"📦 {tr}: {old} → {new}")
+            tracks[tr]["status"] = new
+            changed_any = True
+        elif old is None and new != "unknown":
+            tracks[tr]["status"] = new
+            changed_any = True
+
+        save_tracks(tracks)
+
+    if changed_any:
+        # на будущее: можно логировать/метрики
+        pass
+
+
+# ------------------ Bot runner (imported by bot_runner.py) ------------------
 def run_bot() -> None:
     """
-    Точка входа, которую импортирует bot_runner.py:
-    from main import run_bot
+    Эту функцию вызывает bot_runner.py: from main import run_bot
     """
-    import asyncio
-    asyncio.run(_run_bot_async_entry())
+    app_tg = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex(r"^➕ Добавить трек$"), start_add),
+            MessageHandler(filters.Regex(r"^➖ Удалить трек$"), start_del),
+        ],
+        states={
+            ADD_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_track)],
+            DEL_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, del_track)],
+        },
+        fallbacks=[MessageHandler(filters.Regex(r"^ℹ️ Помощь$"), cmd_help)],
+        allow_reentry=True,
+    )
+
+    app_tg.add_handler(conv)
+    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
+
+    # стартовое сообщение при запуске
+    async def post_init(app_):
+        # job-queue должен быть установлен через python-telegram-bot[job-queue]
+        if app_.job_queue:
+            app_.job_queue.run_repeating(check_all_tracks, interval=POLL_SECONDS, first=10)
+
+    app_tg.post_init = post_init
+
+    # Важно: только ОДИН экземпляр polling должен работать
+    app_tg.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    run_bot()
