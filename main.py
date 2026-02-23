@@ -2,22 +2,32 @@ import asyncio
 import json
 import os
 import re
-import requests
+import threading
 from pathlib import Path
+
+import requests
+from flask import Flask
 from playwright.async_api import async_playwright
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
+# --- ENV ---
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = str(os.environ["CHAT_ID"])
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "600"))  # 10 минут
+PORT = int(os.environ.get("PORT", "10000"))
 
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "600"))  # 10 минут по умолчанию
-
-# ВАЖНО: на бесплатном Render это будет временное хранилище.
 STATE_FILE = Path("tracks.json")
-
 TRACK_RE = re.compile(r"[?&]track=([\d\-]+)")
 
+# --- tiny web server (Render wants an open port for Web Service) ---
+app = Flask(__name__)
+
+@app.get("/")
+def home():
+    return "ok", 200
+
+# --- helpers ---
 def load_tracks() -> dict:
     if STATE_FILE.exists():
         try:
@@ -63,7 +73,6 @@ async def ozon_get_status(track: str) -> str:
     return "unknown"
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Только ты
     if str(update.effective_chat.id) != CHAT_ID:
         return
 
@@ -84,7 +93,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Добавил трек: {track}")
 
 async def watcher_loop():
-    # Первый запуск: фиксируем статусы без спама
+    # первичная инициализация без спама
     tracks = load_tracks()
     changed = False
     for track, info in tracks.items():
@@ -122,12 +131,14 @@ async def watcher_loop():
 
         await asyncio.sleep(POLL_SECONDS)
 
-async def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
+async def bot_main():
+    tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     asyncio.create_task(watcher_loop())
-    await app.run_polling(close_loop=False)
+    await tg_app.run_polling(close_loop=False)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+def run_bot_in_thread():
+    asyncio.run(bot_main())
+
+# Запускаем бота в фоне, а Flask отдаёт порт
+threading.Thread(target=run_bot_in_thread, daemon=True).start()
