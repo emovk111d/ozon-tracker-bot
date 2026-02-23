@@ -107,3 +107,14 @@ def ozon_get_status_sync(track: str) -> tuple[str, str | None]:
 async def ozon_get_status(track: str) -> tuple[str, str | None]:
     # чтобы не блокировать event loop телеграм-бота
     return await asyncio.to_thread(ozon_get_status_sync, track)
+# --- entrypoints for bot_runner.py ---
+async def _run_bot_async_entry() -> None:
+    await run_bot_async()  # если у тебя функция называется run_bot_async
+
+def run_bot() -> None:
+    """
+    Точка входа, которую импортирует bot_runner.py:
+    from main import run_bot
+    """
+    import asyncio
+    asyncio.run(_run_bot_async_entry())
