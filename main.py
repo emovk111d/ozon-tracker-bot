@@ -7,8 +7,8 @@ from pathlib import Path
 import requests
 from flask import Flask
 from playwright.async_api import async_playwright
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
 # --- ENV ---
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -18,6 +18,14 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 STATE_FILE = Path("tracks.json")
 TRACK_RE = re.compile(r"[?&]track=([\d\-]+)")
+MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        ["📦 Отслеживаемые заказы"],
+        ["➕ Добавить трек", "➖ Удалить трек"],
+        ["ℹ️ Помощь"],
+    ],
+    resize_keyboard=True,
+)
 
 # --- tiny web server (Render wants an open port for Web Service) ---
 app = Flask(__name__)
@@ -76,7 +84,88 @@ async def ozon_get_status(track: str) -> str:
             return c
     return "unknown"
 
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_chat.id) != CHAT_ID:
+        return
+    await update.message.reply_text(
+        "Я отслеживаю статусы Ozon-треков.\n"
+        "Кидай ссылку tracking.ozon.ru/?track=... или жми кнопки ниже.",
+        reply_markup=MENU,
+    )
 
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_chat.id) != CHAT_ID:
+        return
+    await update.message.reply_text(
+        "Команды и кнопки:\n"
+        "• 📦 Отслеживаемые заказы — список треков и статусов\n"
+        "• ➕ Добавить трек — пришли ссылку tracking.ozon.ru/?track=...\n"
+        "• ➖ Удалить трек — пришли номер трека (пример: 94044975-0220-1)\n",
+        reply_markup=MENU,
+    )
+    async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_chat.id) != CHAT_ID:
+        return
+
+    text = (update.message.text or "").strip()
+
+    # Если это ссылка с track= — НЕ трогаем, пусть обработает handle_message
+    if TRACK_RE.search(text):
+        return
+
+    if text == "📦 Отслеживаемые заказы":
+        tracks = load_tracks()
+        if not tracks:
+            await update.message.reply_text("Пока нет отслеживаемых заказов.", reply_markup=MENU)
+            return
+
+        lines = ["📦 Отслеживаемые заказы:"]
+        for tr, info in tracks.items():
+            st = info.get("status") or "—"
+            lines.append(f"• {tr} — {st}")
+        await update.message.reply_text("\n".join(lines), reply_markup=MENU)
+        return
+
+    if text == "➕ Добавить трек":
+        await update.message.reply_text(
+            "Пришли ссылку вида:\nhttps://tracking.ozon.ru/?track=94044975-0220-1",
+            reply_markup=MENU,
+        )
+        return
+
+    if text == "➖ Удалить трек":
+        context.user_data["awaiting_delete"] = True
+        await update.message.reply_text(
+            "Ок. Пришли номер трека, который удалить (пример: 94044975-0220-1).",
+            reply_markup=MENU,
+        )
+        return
+
+    if text == "ℹ️ Помощь":
+        await cmd_help(update, context)
+        return
+
+    # Режим удаления: ждём трек-номер
+    if context.user_data.get("awaiting_delete"):
+        context.user_data["awaiting_delete"] = False
+        track = re.sub(r"\s+", "", text)
+
+        tracks = load_tracks()
+        if track in tracks:
+            del tracks[track]
+            save_tracks(tracks)
+            await update.message.reply_text(f"➖ Удалил: {track}", reply_markup=MENU)
+        else:
+            await update.message.reply_text(f"Не нашёл в списке: {track}", reply_markup=MENU)
+        return
+
+    # Если написали что-то “левое” — можно мягко подсказать
+    await update.message.reply_text(
+        "Я понял тебя как набор букв, но не как команду 😌\n"
+        "Жми кнопки или кидай ссылку tracking.ozon.ru/?track=...",
+        reply_markup=MENU,
+    )
+    
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Только ты
     if str(update.effective_chat.id) != CHAT_ID:
@@ -93,12 +182,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tracks = load_tracks()
 
     if track in tracks:
-        await update.message.reply_text(f"Уже отслеживается: {track}")
+        await update.message.reply_text(f"Уже отслеживается: {track}", reply_markup=MENU)
         return
 
     tracks[track] = {"status": None}
     save_tracks(tracks)
-    await update.message.reply_text(f"✅ Добавил трек: {track}")
+    await update.message.reply_text(f"✅ Добавил трек: {track}", reply_markup=MENU)
 
 
 async def watcher_loop():
@@ -151,6 +240,12 @@ def run_bot() -> None:
     python-telegram-bot сам управляет event loop внутри run_polling().
     """
     tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    tg_app.add_handler(CommandHandler("start", cmd_start))
+    tg_app.add_handler(CommandHandler("help", cmd_help))
+
+    # СНАЧАЛА меню, ПОТОМ ссылки
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Запускаем watcher внутри event loop приложения
