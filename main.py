@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import re
-import threading
 from pathlib import Path
 
 import requests
@@ -27,6 +26,7 @@ app = Flask(__name__)
 def home():
     return "ok", 200
 
+
 # --- helpers ---
 def load_tracks() -> dict:
     if STATE_FILE.exists():
@@ -37,7 +37,10 @@ def load_tracks() -> dict:
     return {}
 
 def save_tracks(data: dict) -> None:
-    STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    STATE_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 def tg_send(text: str) -> None:
     requests.post(
@@ -45,6 +48,7 @@ def tg_send(text: str) -> None:
         json={"chat_id": CHAT_ID, "text": text},
         timeout=20,
     )
+
 
 async def ozon_get_status(track: str) -> str:
     url = f"https://tracking.ozon.ru/?track={track}&__rr=1"
@@ -72,13 +76,17 @@ async def ozon_get_status(track: str) -> str:
             return c
     return "unknown"
 
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Только ты
     if str(update.effective_chat.id) != CHAT_ID:
         return
 
     text = (update.message.text or "").strip()
     m = TRACK_RE.search(text)
     if not m:
+        # Можешь раскомментировать, если хочешь, чтобы бот отвечал на "не то":
+        # await update.message.reply_text("Кинь ссылку вида tracking.ozon.ru/?track=...")
         return
 
     track = m.group(1)
@@ -91,6 +99,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tracks[track] = {"status": None}
     save_tracks(tracks)
     await update.message.reply_text(f"✅ Добавил трек: {track}")
+
 
 async def watcher_loop():
     # первичная инициализация без спама
@@ -116,13 +125,16 @@ async def watcher_loop():
             old = info.get("status")
             try:
                 new = await ozon_get_status(track)
+
                 if new != "unknown" and old is not None and new != old:
                     tg_send(f"📦 {track}: {old} → {new}")
                     info["status"] = new
                     updated = True
+
                 elif old is None and new != "unknown":
                     info["status"] = new
                     updated = True
+
             except Exception:
                 continue
 
@@ -131,17 +143,28 @@ async def watcher_loop():
 
         await asyncio.sleep(POLL_SECONDS)
 
-async def bot_main():
+
+def run_bot() -> None:
+    """
+    Запускает Telegram polling.
+    Важно: НЕ оборачиваем это в asyncio.run().
+    python-telegram-bot сам управляет event loop внутри run_polling().
+    """
     tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    asyncio.create_task(watcher_loop())
-    await tg_app.run_polling(close_loop=False)
 
-async def bot_main():
-    tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    asyncio.create_task(watcher_loop())
-    await tg_app.run_polling(close_loop=False)
+    # Запускаем watcher внутри event loop приложения
+    async def post_init(app):
+        app.create_task(watcher_loop())
 
+    tg_app.post_init = post_init
+
+    # Блокирующий запуск polling
+    tg_app.run_polling()
+
+
+# Важно: тут НЕТ автозапуска бота при импорте.
+# Gunicorn будет импортировать main:app (Flask),
+# а бот мы запустим отдельным процессом через bot_runner.py.
 if __name__ == "__main__":
-    asyncio.run(bot_main())
+    run_bot()
