@@ -154,46 +154,36 @@ async def ozon_get_status(track: str) -> str:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
-        context = await browser.new_context(
-            locale="ru-RU",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-        )
+        context = await browser.new_context(locale="ru-RU")
         page = await context.new_page()
 
-        # 1) Открываем главную
         await page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
 
-        # 2) Ищем инпут и вводим трек как человек
-        # На сайте селекторы могут меняться, поэтому берём "первый попавшийся input"
         inp = page.locator("input").first
         await inp.wait_for(timeout=20000)
         await inp.fill(track)
         await inp.press("Enter")
 
-        # 3) Дадим странице догрузить результаты
-        await page.wait_for_load_state("networkidle", timeout=60000)
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(2500)  # чуть дольше, чем networkidle
+        await page.wait_for_load_state("domcontentloaded")
 
-        # 4) Читаем текст страницы
+        current_url = page.url
+        title = await page.title()
         body_text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+        text = " ".join((body_text or "").split()).lower()
 
         await context.close()
         await browser.close()
 
-    text = " ".join((body_text or "").split()).lower()
+    # 👇 это увидишь в Render Logs
+    print("OZON DEBUG URL:", current_url)
+    print("OZON DEBUG TITLE:", title)
+    print("OZON DEBUG TEXT HEAD:", text[:800])
 
-    # На всякий случай: если нас встретил антибот/пустая страница
-    if len(text) < 80:
-        return "unknown"
+    # временно всегда unknown
+    return "unknown"
 
     statuses = [
         "создан",
