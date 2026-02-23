@@ -116,40 +116,57 @@ STATUS_CANDIDATES = [
 
 
 async def ozon_get_status(track: str) -> str:
-    url = f"https://tracking.ozon.ru/?track={track}&__rr=1"
+    url = f"https://tracking.ozon.ru/?track={track}"
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,  # можно True, но добавим маскировку
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
+                "Chrome/120.0.0.0 Safari/537.36"
             ),
-            locale="ru-RU",
+            viewport={"width": 1280, "height": 800},
         )
+
         page = await context.new_page()
 
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        # иногда контент подгружается чуть позже
-        await page.wait_for_timeout(2000)
+        await page.goto(url, wait_until="networkidle", timeout=60000)
 
-        current_url = page.url
-        title = await page.title()
-        body_text = await page.inner_text("body")
+        # Ждём появления текста статусов
+        await page.wait_for_timeout(5000)
+
+        body = await page.inner_text("body")
 
         await browser.close()
 
-    text = " ".join(body_text.split()).lower()
+    text = body.lower()
 
-    # debug to Render logs
-    print("OZON DEBUG URL:", current_url, flush=True)
-    print("OZON DEBUG TITLE:", title, flush=True)
-    print("OZON DEBUG TEXT HEAD:", text[:900], flush=True)
+    # реальные статусы Ozon
+    statuses = [
+        "создан",
+        "передается в доставку",
+        "в пути",
+        "заказ принят перевозчиком",
+        "на таможне",
+        "выпущен импортной таможней",
+        "прибыл",
+        "в городе получателя",
+        "передан курьеру",
+        "доставлен",
+        "готов к выдаче",
+    ]
 
-    for c in STATUS_CANDIDATES:
-        if c in text:
-            return c
+    for s in statuses:
+        if s in text:
+            return s
+
+    # для отладки
+    print("DEBUG BODY:", text[:500], flush=True)
 
     return "unknown"
 
