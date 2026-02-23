@@ -2,76 +2,59 @@ import asyncio
 import json
 import os
 import re
-import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
 
 import requests
 from flask import Flask
 from playwright.async_api import async_playwright
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
-    ContextTypes,
-    CommandHandler,
     MessageHandler,
+    CommandHandler,
     filters,
+    ContextTypes,
 )
+from telegram import ReplyKeyboardMarkup, KeyboardButton
 
-# =========================
-# ENV
-# =========================
+# --- ENV ---
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = str(os.environ["CHAT_ID"])  # твой chat_id строкой
+CHAT_ID = str(os.environ["CHAT_ID"])  # твой chat_id (строкой)
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "600"))  # 10 минут
 PORT = int(os.environ.get("PORT", "10000"))
 
 STATE_FILE = Path("tracks.json")
-META_FILE = Path("meta.json")
 
-# Ловим и ссылки, и просто трек-номер
-TRACK_RE = re.compile(r"(?:(?:\?|&)track=)?(\d{6,}-\d{4,}-\d{1,})", re.IGNORECASE)
+# принимаем либо ссылку, либо просто трек-номер
+TRACK_RE = re.compile(r"(?:[?&]track=)?([\d\-]{6,})", re.IGNORECASE)
 
-# =========================
-# Flask (Render Web Service требует порт)
-# =========================
+# --- tiny web server (Render wants an open port for Web Service) ---
 app = Flask(__name__)
+
 
 @app.get("/")
 def home():
     return "ok", 200
 
 
-# =========================
-# Storage helpers
-# =========================
-def load_json(path: Path) -> dict:
-    if path.exists():
+# --- storage helpers ---
+def load_tracks() -> dict:
+    if STATE_FILE.exists():
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except Exception:
             return {}
     return {}
 
-def save_json(path: Path, data: dict) -> None:
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def load_tracks() -> Dict[str, dict]:
-    return load_json(STATE_FILE)
-
-def save_tracks(data: Dict[str, dict]) -> None:
-    save_json(STATE_FILE, data)
-
-def load_meta() -> dict:
-    return load_json(META_FILE)
-
-def save_meta(data: dict) -> None:
-    save_json(META_FILE, data)
+def save_tracks(data: dict) -> None:
+    STATE_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
-# =========================
-# Telegram send (в watcher)
-# =========================
+# --- telegram send helper (plain HTTP) ---
 def tg_send(text: str) -> None:
     requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -80,10 +63,8 @@ def tg_send(text: str) -> None:
     )
 
 
-# =========================
-# UI (кнопки)
-# =========================
-MENU = ReplyKeyboardMarkup(
+# --- menu keyboard ---
+MENU_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton("➕ Добавить трек"), KeyboardButton("📦 Отслеживаемые")],
         [KeyboardButton("➖ Удалить трек"), KeyboardButton("ℹ️ Помощь")],
@@ -91,273 +72,219 @@ MENU = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+
 HELP_TEXT = (
-    "Я слежу за публичным трекингом Ozon.\n\n"
-    "• Нажми «➕ Добавить трек» и пришли ссылку вида:\n"
-    "  https://tracking.ozon.ru/?track=94044975-0220-1\n"
-    "  или просто трек-номер: 94044975-0220-1\n\n"
-    "• «📦 Отслеживаемые» — список треков и текущих статусов\n"
-    "• «➖ Удалить трек» — удаление по номеру\n\n"
-    f"Опрос статусов раз в {POLL_SECONDS//60} мин."
+    "Кидай ссылку вида:\n"
+    "https://tracking.ozon.ru/?track=94044975-0220-1\n"
+    "или просто трек-номер: 94044975-0220-1\n\n"
+    "Кнопки:\n"
+    "• 📦 Отслеживаемые — список треков и статусов\n"
+    "• ➖ Удалить трек — удаление по номеру\n\n"
+    f"Опрос статусов раз в {POLL_SECONDS//60} мин.\n"
 )
 
 
-# =========================
-# Ozon parsing
-# =========================
-# ВАЖНО: тут должны быть реальные фразы из трекинга
+# --- OZON parsing ---
 STATUS_CANDIDATES = [
-    # из твоего скрина / типовые
+    # из твоих скринов + базовые
     "создан",
     "передается в доставку",
-    "передаётся в доставку",
     "в пути",
     "заказ принят перевозчиком",
-    "заказ принят перевозчиком",
+    "заказ везут на таможню в стране отправления",
+    "заказ привезли на таможню для экспортного таможенного оформления",
+    "заказ везут на таможню в стране назначения",
+    "заказ привезли в страну назначения",
+    "заказ передан на импортное таможенное оформление",
+    "заказ проходит импортное таможенное оформление",
+    "заказ выпущен импортной таможней",
+    "заказ отправили на сортировочный терминал",
+    "заказ покинул сортировочный терминал",
+    "заказ ожидает отправки в город получателя",
+    "заказ везут в город получателя",
+    "заказ везут",
+    "заказ передали в курьерскую доставку",
     "готово к выдаче",
     "на пункте выдачи",
-    "в пункте выдачи",
-    "прибыло",
-    "прибыл",
-    "передано",
-    "получено",
     "доставлено",
+    "получено",
     "ожидает",
+    "прибыло",
+    "передано",
     "отправлено",
-    "собран",
-    "собирает",
 ]
 
-def normalize_status(text: str) -> str:
-    """Нормализуем разные формулировки к коротким статусам."""
-    t = text.lower()
-    mapping = [
-        ("создан", "создан"),
-        ("передается в доставку", "передается в доставку"),
-        ("передаётся в доставку", "передается в доставку"),
-        ("в пути", "в пути"),
-        ("заказ принят перевозчиком", "принят перевозчиком"),
-        ("готово к выдаче", "готово к выдаче"),
-        ("на пункте выдачи", "на пункте выдачи"),
-        ("в пункте выдачи", "на пункте выдачи"),
-        ("доставлено", "доставлено"),
-        ("получено", "получено"),
-    ]
-    for k, v in mapping:
-        if k in t:
-            return v
-    return text
 
 async def ozon_get_status(track: str) -> str:
-    base_url = "https://tracking.ozon.ru"
+    url = f"https://tracking.ozon.ru/?track={track}&__rr=1"
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            locale="ru-RU",
         )
-        context = await browser.new_context(locale="ru-RU")
         page = await context.new_page()
 
-        await page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
-
-        inp = page.locator("input").first
-        await inp.wait_for(timeout=20000)
-        await inp.fill(track)
-        await inp.press("Enter")
-
-        await page.wait_for_timeout(2500)  # чуть дольше, чем networkidle
-        await page.wait_for_load_state("domcontentloaded")
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        # иногда контент подгружается чуть позже
+        await page.wait_for_timeout(2000)
 
         current_url = page.url
         title = await page.title()
-        body_text = await page.evaluate("() => document.body ? document.body.innerText : ''")
-        text = " ".join((body_text or "").split()).lower()
+        body_text = await page.inner_text("body")
 
-        await context.close()
         await browser.close()
 
-    # 👇 это увидишь в Render Logs
-    print("OZON DEBUG URL:", current_url)
-    print("OZON DEBUG TITLE:", title)
-    print("OZON DEBUG TEXT HEAD:", text[:800])
+    text = " ".join(body_text.split()).lower()
 
-    # временно всегда unknown
-    return "unknown"
+    # debug to Render logs
+    print("OZON DEBUG URL:", current_url, flush=True)
+    print("OZON DEBUG TITLE:", title, flush=True)
+    print("OZON DEBUG TEXT HEAD:", text[:900], flush=True)
 
-    statuses = [
-        "создан",
-        "передается в доставку",
-        "передаётся в доставку",
-        "передан в доставку",
-        "в пути",
-        "заказ принят перевозчиком",
-        "заказ везут на таможню",
-        "заказ везут на таможню в стране отправления",
-        "заказ везут на таможню в стране назначения",
-        "заказ привезли на таможню",
-        "заказ передан на импортное таможенное оформление",
-        "заказ проходит импортное таможенное оформление",
-        "заказ выпущен импортной таможней",
-        "заказ отправили на сортировочный терминал",
-        "заказ покинул сортировочный терминал",
-        "заказ ожидает отправки в город получателя",
-        "заказ везут в город получателя",
-        "заказ везут",
-        "заказ передали в курьерскую доставку",
-        "на пункте выдачи",
-        "готово к выдаче",
-        "доставлено",
-        "получено",
-        "успешно доставлен",
-    ]
-
-    for s in statuses:
-        if s in text:
-            return s
+    for c in STATUS_CANDIDATES:
+        if c in text:
+            return c
 
     return "unknown"
 
-# =========================
-# Bot logic
-# =========================
-def is_my_chat(update: Update) -> bool:
-    return str(update.effective_chat.id) == CHAT_ID
 
-def get_flags(context: ContextTypes.DEFAULT_TYPE) -> dict:
-    # user_data работает на одного пользователя в polling.
-    return context.user_data.setdefault("flags", {})
-
+# --- bot commands / handlers ---
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_my_chat(update):
+    if str(update.effective_chat.id) != CHAT_ID:
         return
-    await update.message.reply_text("Ок, я тут. Жми кнопки. 😼", reply_markup=MENU)
-    await update.message.reply_text(HELP_TEXT)
+    await update.message.reply_text("🤖 Бот запущен. Жми кнопки или кидай трек/ссылку.", reply_markup=MENU_KB)
+    await update.message.reply_text(HELP_TEXT, reply_markup=MENU_KB)
 
-async def show_tracks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_my_chat(update):
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_chat.id) != CHAT_ID:
         return
+    await update.message.reply_text(HELP_TEXT, reply_markup=MENU_KB)
+
+
+async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_chat.id) != CHAT_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /debug 94044975-0220-1", reply_markup=MENU_KB)
+        return
+
+    track = context.args[0].strip()
+    status = await ozon_get_status(track)
+    await update.message.reply_text(
+        f"debug status = {status}\n(подробности смотри в Render Logs: OZON DEBUG ...)",
+        reply_markup=MENU_KB,
+    )
+
+
+async def list_tracks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tracks = load_tracks()
     if not tracks:
-        await update.message.reply_text("Пока пусто. Добавь трек через «➕ Добавить трек».", reply_markup=MENU)
+        await update.message.reply_text("Пока нет отслеживаемых треков.", reply_markup=MENU_KB)
         return
 
     lines = ["📦 Отслеживаемые треки:"]
     for t, info in tracks.items():
         st = info.get("status") or "unknown"
         lines.append(f"• {t} — {st}")
-    await update.message.reply_text("\n".join(lines), reply_markup=MENU)
+    await update.message.reply_text("\n".join(lines), reply_markup=MENU_KB)
 
-async def handle_menu_and_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_my_chat(update):
+
+async def delete_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting_delete"] = True
+    await update.message.reply_text("Введи трек-номер, который удалить:", reply_markup=MENU_KB)
+
+
+async def add_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting_add"] = True
+    await update.message.reply_text("Пришли ссылку/трек вида:\nhttps://tracking.ozon.ru/?track=940... или 940...", reply_markup=MENU_KB)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_chat.id) != CHAT_ID:
         return
 
     text = (update.message.text or "").strip()
-    flags = get_flags(context)
 
-    # --- menu clicks ---
+    # кнопки меню
     if text == "📦 Отслеживаемые":
-        await show_tracks(update, context)
+        await list_tracks(update, context)
         return
 
     if text == "ℹ️ Помощь":
-        await update.message.reply_text(HELP_TEXT, reply_markup=MENU)
+        await update.message.reply_text(HELP_TEXT, reply_markup=MENU_KB)
         return
 
     if text == "➕ Добавить трек":
-        flags["await_add"] = True
-        flags.pop("await_remove", None)
-        await update.message.reply_text(
-            "Пришли ссылку вида:\nhttps://tracking.ozon.ru/?track=94044975-0220-1\nили просто трек-номер.",
-            reply_markup=MENU,
-        )
+        await add_flow(update, context)
         return
 
     if text == "➖ Удалить трек":
-        flags["await_remove"] = True
-        flags.pop("await_add", None)
-        await update.message.reply_text("Ок. Пришли трек-номер, который удалить.", reply_markup=MENU)
+        await delete_flow(update, context)
         return
 
-    # --- expecting remove ---
-    if flags.get("await_remove"):
+    # режим удаления
+    if context.user_data.get("awaiting_delete"):
+        context.user_data["awaiting_delete"] = False
         m = TRACK_RE.search(text)
         if not m:
-            await update.message.reply_text("Это не похоже на трек-номер. Попробуй ещё раз.", reply_markup=MENU)
+            await update.message.reply_text("Не похоже на трек-номер. Попробуй ещё раз.", reply_markup=MENU_KB)
             return
-
         track = m.group(1)
+
         tracks = load_tracks()
         if track in tracks:
             tracks.pop(track, None)
             save_tracks(tracks)
-            await update.message.reply_text(f"🗑️ Удалил: {track}", reply_markup=MENU)
+            await update.message.reply_text(f"🗑️ Удалил трек: {track}", reply_markup=MENU_KB)
         else:
-            await update.message.reply_text(f"Не найдено в списке: {track}", reply_markup=MENU)
-
-        flags["await_remove"] = False
+            await update.message.reply_text(f"Такого трека нет в списке: {track}", reply_markup=MENU_KB)
         return
 
-    # --- add by link/number (either direct, or after clicking menu) ---
-    if flags.get("await_add") or "track=" in text or TRACK_RE.fullmatch(text) or TRACK_RE.search(text):
-        m = TRACK_RE.search(text)
-        if not m:
-            await update.message.reply_text("Не вижу трек. Нужен трек-номер или ссылка с ?track=...", reply_markup=MENU)
-            return
+    # режим добавления (или просто сообщение с треком)
+    if context.user_data.get("awaiting_add"):
+        context.user_data["awaiting_add"] = False
 
-        track = m.group(1)
-        tracks = load_tracks()
-
-        if track in tracks:
-            await update.message.reply_text(f"Уже отслеживается: {track}", reply_markup=MENU)
-            flags["await_add"] = False
-            return
-
-        tracks[track] = {"status": None, "added_at": int(time.time())}
-        save_tracks(tracks)
-        await update.message.reply_text(f"✅ Добавил трек: {track}", reply_markup=MENU)
-        flags["await_add"] = False
+    m = TRACK_RE.search(text)
+    if not m:
+        # тихо игнорим, чтобы не бесить
         return
 
-    # default: ignore or gentle hint
-    await update.message.reply_text("Жми кнопки 🙂", reply_markup=MENU)
+    track = m.group(1)
+    tracks = load_tracks()
+
+    if track in tracks:
+        await update.message.reply_text(f"Уже отслеживается: {track}", reply_markup=MENU_KB)
+        return
+
+    tracks[track] = {"status": None}
+    save_tracks(tracks)
+    await update.message.reply_text(f"✅ Добавил трек: {track}", reply_markup=MENU_KB)
 
 
-# =========================
-# Watcher loop
-# =========================
-def should_send_startup_ping() -> bool:
-    """
-    Render free-инстанс любит рестартиться.
-    Чтобы не спамить “Бот запущен…”, шлём не чаще 1 раза в 6 часов.
-    """
-    meta = load_meta()
-    last = int(meta.get("last_startup_ping", 0))
-    now = int(time.time())
-    if now - last >= 6 * 3600:
-        meta["last_startup_ping"] = now
-        save_meta(meta)
-        return True
-    return False
-
+# --- watcher loop ---
 async def watcher_loop():
-    # первичная инициализация статусов без спама в чат
+    # первичная инициализация (без спама)
     tracks = load_tracks()
     changed = False
-
     for track, info in tracks.items():
         if info.get("status") is None:
             try:
                 info["status"] = await ozon_get_status(track)
                 changed = True
-            except Exception:
-                pass
-
+            except Exception as e:
+                print("OZON INIT ERROR:", repr(e), flush=True)
     if changed:
         save_tracks(tracks)
 
-    if should_send_startup_ping():
-        tg_send("🤖 Бот запущен. Жми «➕ Добавить трек» или кидай ссылки tracking.ozon.ru/?track=...")
+    # сообщение "бот запущен" отправляем один раз при старте процесса
+    tg_send("🤖 Бот запущен. Жми /start или кидай треки.")
 
     while True:
         tracks = load_tracks()
@@ -372,12 +299,12 @@ async def watcher_loop():
                     tg_send(f"📦 {track}: {old} → {new}")
                     info["status"] = new
                     updated = True
-
                 elif old is None and new != "unknown":
                     info["status"] = new
                     updated = True
 
-            except Exception:
+            except Exception as e:
+                print("OZON LOOP ERROR:", track, repr(e), flush=True)
                 continue
 
         if updated:
@@ -386,24 +313,23 @@ async def watcher_loop():
         await asyncio.sleep(POLL_SECONDS)
 
 
-# =========================
-# Entrypoint for bot_runner.py
-# =========================
 def run_bot() -> None:
     """
-    Запускаем polling.
-    watcher_loop стартуем через post_init (внутри loop приложения).
+    Важно: НЕ asyncio.run().
+    python-telegram-bot сам управляет event loop внутри run_polling().
     """
     tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     tg_app.add_handler(CommandHandler("start", start_cmd))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_and_text))
+    tg_app.add_handler(CommandHandler("help", help_cmd))
+    tg_app.add_handler(CommandHandler("debug", debug_cmd))
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     async def post_init(app_):
+        # ✅ запуск watcher ТОЛЬКО после старта приложения
         app_.create_task(watcher_loop())
 
     tg_app.post_init = post_init
-
     tg_app.run_polling()
 
 
