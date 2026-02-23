@@ -1,4 +1,4 @@
-python-telegram-bot==21.6
+python-telegram-bot[job-queue]==21.6
 playwright==1.49.0
 requests==2.32.3
 flask==3.0.3
