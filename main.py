@@ -8,7 +8,13 @@ import requests
 from flask import Flask
 from playwright.async_api import async_playwright
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 # --- ENV ---
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -18,6 +24,7 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 STATE_FILE = Path("tracks.json")
 TRACK_RE = re.compile(r"[?&]track=([\d\-]+)")
+
 MENU = ReplyKeyboardMarkup(
     keyboard=[
         ["📦 Отслеживаемые заказы"],
@@ -29,6 +36,7 @@ MENU = ReplyKeyboardMarkup(
 
 # --- tiny web server (Render wants an open port for Web Service) ---
 app = Flask(__name__)
+
 
 @app.get("/")
 def home():
@@ -44,11 +52,13 @@ def load_tracks() -> dict:
             return {}
     return {}
 
+
 def save_tracks(data: dict) -> None:
     STATE_FILE.write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
 
 def tg_send(text: str) -> None:
     requests.post(
@@ -84,6 +94,8 @@ async def ozon_get_status(track: str) -> str:
             return c
     return "unknown"
 
+
+# --- commands ---
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != CHAT_ID:
         return
@@ -92,6 +104,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Кидай ссылку tracking.ozon.ru/?track=... или жми кнопки ниже.",
         reply_markup=MENU,
     )
+
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != CHAT_ID:
@@ -103,13 +116,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• ➖ Удалить трек — пришли номер трека (пример: 94044975-0220-1)\n",
         reply_markup=MENU,
     )
-    async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+
+# --- menu handler ---
+async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != CHAT_ID:
         return
 
     text = (update.message.text or "").strip()
 
-    # Если это ссылка с track= — НЕ трогаем, пусть обработает handle_message
+    # Если это ссылка с track= — не трогаем, обработает handle_message
     if TRACK_RE.search(text):
         return
 
@@ -145,7 +161,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_help(update, context)
         return
 
-    # Режим удаления: ждём трек-номер
+    # Режим удаления
     if context.user_data.get("awaiting_delete"):
         context.user_data["awaiting_delete"] = False
         track = re.sub(r"\s+", "", text)
@@ -159,23 +175,20 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Не нашёл в списке: {track}", reply_markup=MENU)
         return
 
-    # Если написали что-то “левое” — можно мягко подсказать
     await update.message.reply_text(
-        "Я понял тебя как набор букв, но не как команду 😌\n"
         "Жми кнопки или кидай ссылку tracking.ozon.ru/?track=...",
         reply_markup=MENU,
     )
-    
+
+
+# --- link handler (adds tracking) ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Только ты
     if str(update.effective_chat.id) != CHAT_ID:
         return
 
     text = (update.message.text or "").strip()
     m = TRACK_RE.search(text)
     if not m:
-        # Можешь раскомментировать, если хочешь, чтобы бот отвечал на "не то":
-        # await update.message.reply_text("Кинь ссылку вида tracking.ozon.ru/?track=...")
         return
 
     track = m.group(1)
@@ -204,6 +217,7 @@ async def watcher_loop():
     if changed:
         save_tracks(tracks)
 
+    # Одно приветствие на старт процесса
     tg_send("🤖 Бот запущен. Кидай ссылки tracking.ozon.ru/?track=...")
 
     while True:
@@ -236,7 +250,6 @@ async def watcher_loop():
 def run_bot() -> None:
     """
     Запускает Telegram polling.
-    Важно: НЕ оборачиваем это в asyncio.run().
     python-telegram-bot сам управляет event loop внутри run_polling().
     """
     tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -244,22 +257,17 @@ def run_bot() -> None:
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("help", cmd_help))
 
-    # СНАЧАЛА меню, ПОТОМ ссылки
+    # Сначала меню, потом ссылки
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Запускаем watcher внутри event loop приложения
     async def post_init(app):
         app.create_task(watcher_loop())
 
     tg_app.post_init = post_init
 
-    # Блокирующий запуск polling
     tg_app.run_polling()
 
 
-# Важно: тут НЕТ автозапуска бота при импорте.
-# Gunicorn будет импортировать main:app (Flask),
-# а бот мы запустим отдельным процессом через bot_runner.py.
 if __name__ == "__main__":
     run_bot()
