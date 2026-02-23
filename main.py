@@ -137,10 +137,11 @@ async def bot_main():
     asyncio.create_task(watcher_loop())
     await tg_app.run_polling(close_loop=False)
 
-def run_bot_in_thread():
-    asyncio.run(bot_main())
+async def bot_main():
+    tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    asyncio.create_task(watcher_loop())
+    await tg_app.run_polling(close_loop=False)
 
-# Запускаем бота в фоне, а Flask отдаёт порт
-threading.Thread(target=run_bot_in_thread, daemon=True).start()
 if __name__ == "__main__":
-    asyncio.run(run_bot())
+    asyncio.run(bot_main())
