@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
-# веб для Render (порт)
+# Flask для Render (порт)
 gunicorn -b 0.0.0.0:$PORT main:app &
 
-# телеграм polling как главный процесс
+# Телеграм бот как главный процесс
 python main.py
