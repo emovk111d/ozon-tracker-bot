@@ -142,3 +142,5 @@ def run_bot_in_thread():
 
 # Запускаем бота в фоне, а Flask отдаёт порт
 threading.Thread(target=run_bot_in_thread, daemon=True).start()
+if __name__ == "__main__":
+    asyncio.run(run_bot())
