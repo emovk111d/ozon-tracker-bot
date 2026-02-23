@@ -255,11 +255,11 @@ def run_bot() -> None:
     tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     tg_app.add_handler(CommandHandler("start", cmd_start))
-    tg_app.add_handler(CommandHandler("help", cmd_help))
+tg_app.add_handler(CommandHandler("help", cmd_help))
 
-    # Сначала меню, потом ссылки
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+# СНАЧАЛА обработка ссылки (трек), ПОТОМ меню
+tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
 
     async def post_init(app):
         app.create_task(watcher_loop())
